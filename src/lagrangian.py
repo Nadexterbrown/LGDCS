@@ -142,213 +142,155 @@ class GasState:
         )
 
 
-class IdealGasEOS:
+class EOS:
     """
-    Equation of State for calorically perfect ideal gas
+    Unified Equation of State with auto-detection of Cantera.
 
-    Relations:
-        p = (γ-1) ρ e
-        c² = γ p / ρ
-        e = p / ((γ-1) ρ)
-        T = p / (ρ R)  [if R specified]
+    Automatically uses Cantera for accurate thermodynamics if available,
+    otherwise falls back to ideal gas calculations.
+
+    Initialization Priority:
+    1. gas_config dict provided -> Use Cantera with specified mixture
+    2. Cantera gas object provided -> Use Cantera directly
+    3. Cantera available, no config -> Use Cantera with air at STP (warning)
+    4. Cantera not available -> Use ideal gas (warning)
+
+    Example Usage:
+    --------------
+    # With gas_config (recommended for combustion):
+    eos = EOS(gas_config={'T': 300, 'P': 101325, 'Fuel': 'CH4',
+                          'Oxidizer': 'O2:1, N2:3.76', 'Phi': 1.0,
+                          'mech': 'gri30.yaml'})
+
+    # Simple ideal gas (for verification):
+    eos = EOS(gamma=1.4, R_gas=287.0)
+
+    # Auto-detect with air:
+    eos = EOS()  # Uses Cantera with air if available, else ideal gas
     """
 
-    def __init__(self, gamma: float = 1.4, R_gas: Optional[float] = None):
+    def __init__(self,
+                 gas_config: Optional[Dict[str, Any]] = None,
+                 gas: Optional[Any] = None,
+                 gamma: float = 1.4,
+                 R_gas: float = 287.0):
         """
+        Initialize EOS with auto-detection.
+
         Parameters:
         -----------
+        gas_config : dict, optional
+            Configuration for Cantera gas (INPUT_PARAMS_CONFIG style):
+            - 'mech': Mechanism file (default: 'gri30.yaml')
+            - 'T': Temperature [K]
+            - 'P': Pressure [Pa]
+            - 'Fuel': Fuel species (e.g., 'H2', 'CH4')
+            - 'Oxidizer': Oxidizer string (e.g., 'O2:1, N2:3.76')
+            - 'Phi': Equivalence ratio
+            - 'composition': Direct composition string (alternative to Fuel/Oxidizer)
+        gas : cantera.Solution, optional
+            Pre-configured Cantera gas object
         gamma : float
-            Ratio of specific heats (default 1.4 for air)
-        R_gas : float, optional
-            Specific gas constant [J/(kg·K)] for temperature calculation
+            Ratio of specific heats for ideal gas fallback (default: 1.4)
+        R_gas : float
+            Specific gas constant for ideal gas fallback [J/(kg·K)] (default: 287.0)
         """
-        self.gamma = gamma
-        self.R_gas = R_gas
+        self._use_cantera = False
+        self._gas = None
+        self._gamma = gamma
+        self._R_gas = R_gas
 
-    def pressure(self, rho: np.ndarray, e: np.ndarray) -> np.ndarray:
-        """Compute pressure from density and internal energy"""
-        return np.maximum((self.gamma - 1.0) * rho * e, 1e-15)
-
-    def sound_speed(self, rho: np.ndarray, p: np.ndarray) -> np.ndarray:
-        """Compute adiabatic sound speed"""
-        return np.sqrt(np.maximum(self.gamma * p / rho, 1e-15))
-
-    def internal_energy(self, rho: np.ndarray, p: np.ndarray) -> np.ndarray:
-        """Compute internal energy from density and pressure"""
-        return p / ((self.gamma - 1.0) * rho)
-
-    def temperature(self, rho: np.ndarray, p: np.ndarray) -> Optional[np.ndarray]:
-        """Compute temperature if gas constant is specified"""
-        if self.R_gas is None:
-            return None
-        return p / (rho * self.R_gas)
-
-    def total_energy(self, rho: np.ndarray, u: np.ndarray, p: np.ndarray) -> np.ndarray:
-        """Compute total specific energy E = e + 0.5*u²"""
-        e = self.internal_energy(rho, p)
-        return e + 0.5 * u**2
-
-    def entropy(self, rho: np.ndarray, p: np.ndarray) -> np.ndarray:
-        """
-        Compute specific entropy for ideal gas.
-
-        For a calorically perfect ideal gas:
-            s = c_v * ln(p / rho^gamma) + s_ref
-
-        We compute entropy relative to a reference state (p_ref=101325 Pa, rho_ref=1.0 kg/m³):
-            s - s_ref = c_v * [ln(p/p_ref) - gamma * ln(rho/rho_ref)]
-
-        Parameters:
-        -----------
-        rho : array
-            Density [kg/m³]
-        p : array
-            Pressure [Pa]
-
-        Returns:
-        --------
-        s : array
-            Specific entropy [J/(kg·K)]
-        """
-        rho = np.atleast_1d(rho)
-        p = np.atleast_1d(p)
-
-        # Reference state
-        p_ref = 101325.0  # Pa
-        rho_ref = 1.0     # kg/m³
-
-        # c_v = R / (gamma - 1) for ideal gas
-        # Use R_gas if specified, otherwise use air value
-        R = self.R_gas if self.R_gas is not None else 287.0
-        c_v = R / (self.gamma - 1.0)
-
-        # s - s_ref = c_v * [ln(p/p_ref) - gamma * ln(rho/rho_ref)]
-        s = c_v * (np.log(p / p_ref) - self.gamma * np.log(rho / rho_ref))
-
-        return s
-
-
-class CanteraEOS:
-    """
-    Equation of State using Cantera for real gas thermodynamics
-
-    This provides accurate thermodynamic properties for real gases and mixtures,
-    including temperature-dependent specific heats and multi-species support.
-
-    The EOS maintains consistency by using Cantera's UVX (internal energy, specific
-    volume, mole fractions) thermodynamic state representation for Lagrangian methods.
-
-    References:
-    -----------
-    Cantera: An object-oriented software toolkit for chemical kinetics,
-    thermodynamics, and transport processes. https://cantera.org
-
-    Usage:
-    ------
-    import cantera as ct
-    gas = ct.Solution('gri30.yaml')
-    eos = CanteraEOS(gas, composition='CH4:1.0, O2:2.0, N2:7.52')
-    # Set state from density and internal energy
-    eos.set_state_UV(u=1e6, v=1.0/1.2)  # e=1e6 J/kg, rho=1.2 kg/m³
-    p = eos.gas.P  # Get pressure
-    """
-
-    def __init__(self, gas, composition: Optional[str] = None):
-        """
-        Initialize Cantera EOS
-
-        Parameters:
-        -----------
-        gas : cantera.Solution
-            Cantera Solution object (e.g., ct.Solution('gri30.yaml'))
-        composition : str, optional
-            Initial composition in Cantera format (e.g., 'CH4:1.0, O2:2.0')
-            If not specified, uses current gas composition
-        """
+        # Try to use Cantera
         try:
             import cantera as ct
             self._ct = ct
+
+            if gas is not None:
+                # Priority 1: Pre-configured gas object
+                self._gas = gas
+                self._use_cantera = True
+
+            elif gas_config is not None:
+                # Priority 2: Create from gas_config
+                mech = gas_config.get('mech', 'gri30.yaml')
+                T = gas_config.get('T', 300.0)
+                P = gas_config.get('P', 101325.0)
+                fuel = gas_config.get('Fuel')
+                oxidizer = gas_config.get('Oxidizer', 'O2:1, N2:3.76')
+                phi = gas_config.get('Phi', 1.0)
+                composition = gas_config.get('composition')
+
+                self._gas = ct.Solution(mech)
+
+                if fuel is not None:
+                    self._gas.set_equivalence_ratio(phi, fuel, oxidizer)
+                    self._gas.TP = T, P
+                elif composition is not None:
+                    self._gas.TPX = T, P, composition
+                else:
+                    self._gas.TPX = T, P, 'O2:0.21, N2:0.79'
+
+                self._use_cantera = True
+
+            else:
+                # Priority 3: Default to air at STP
+                warnings.warn(
+                    "No gas_config provided. Using Cantera with air at STP. "
+                    "For combustion, provide gas_config with fuel/oxidizer/mechanism.",
+                    UserWarning, stacklevel=2
+                )
+                self._gas = ct.Solution('air.yaml')
+                self._gas.TPX = 300.0, 101325.0, 'O2:0.21, N2:0.79'
+                self._use_cantera = True
+
+            # Store initial properties for fallback
+            if self._use_cantera:
+                self._gamma = self._gas.cp / self._gas.cv
+                self._R_gas = 8314.0 / self._gas.mean_molecular_weight
+
         except ImportError:
-            raise ImportError(
-                "Cantera is required for CanteraEOS. Install with: pip install cantera"
+            # Priority 4: Cantera not available
+            warnings.warn(
+                "Cantera not found - using ideal gas EOS. "
+                "Install Cantera for accurate thermodynamics: pip install cantera",
+                UserWarning, stacklevel=2
             )
+            self._use_cantera = False
 
-        self.gas = gas
+        except Exception as e:
+            warnings.warn(
+                f"Failed to initialize Cantera ({e}). Using ideal gas fallback.",
+                UserWarning, stacklevel=2
+            )
+            self._use_cantera = False
 
-        if composition is not None:
-            self.gas.X = composition
+    @property
+    def gas(self) -> Optional[Any]:
+        """Cantera gas object (None if using ideal gas mode)."""
+        return self._gas
 
-        # Store initial composition for resetting
-        self._initial_X = self.gas.X.copy()
-
-        # Store initial mixture properties for fallback calculations
-        # These are computed from the actual mixture, not hardcoded for air
-        self._initial_gamma = self.gas.cp / self.gas.cv
-        self._initial_R_gas = 8314.0 / self.gas.mean_molecular_weight  # J/(kg·K)
-
-        # Cache for effective gamma (computed from Cp/Cv)
-        self._gamma_cache = None
+    @property
+    def use_cantera(self) -> bool:
+        """True if using Cantera backend, False if using ideal gas."""
+        return self._use_cantera
 
     @property
     def gamma(self) -> float:
-        """
-        Effective ratio of specific heats γ = Cp/Cv
-
-        Note: For real gases, this varies with temperature and composition.
-        This returns the current value at the current state.
-        """
-        return self.gas.cp / self.gas.cv
+        """Ratio of specific heats Cp/Cv."""
+        if self._use_cantera and self._gas is not None:
+            return self._gas.cp / self._gas.cv
+        return self._gamma
 
     @property
     def R_gas(self) -> float:
-        """
-        Specific gas constant R = R_universal / M [J/(kg·K)]
+        """Specific gas constant [J/(kg·K)]."""
+        if self._use_cantera and self._gas is not None:
+            return 8314.0 / self._gas.mean_molecular_weight
+        return self._R_gas
 
-        Returns the value for the current mixture composition.
+    def pressure(self, rho: np.ndarray, e: np.ndarray) -> np.ndarray:
         """
-        return 8314.0 / self.gas.mean_molecular_weight
-
-    def set_state_UV(self, u: float, v: float, X: Optional[np.ndarray] = None):
-        """
-        Set thermodynamic state from internal energy and specific volume
-
-        Parameters:
-        -----------
-        u : float
-            Specific internal energy [J/kg]
-        v : float
-            Specific volume [m³/kg] (= 1/ρ)
-        X : array, optional
-            Mole fractions. If None, uses current composition.
-        """
-        if X is not None:
-            self.gas.X = X
-        self.gas.UV = u, v
-
-    def set_state_DP(self, rho: float, p: float, X: Optional[np.ndarray] = None):
-        """
-        Set thermodynamic state from density and pressure
-
-        Parameters:
-        -----------
-        rho : float
-            Density [kg/m³]
-        p : float
-            Pressure [Pa]
-        X : array, optional
-            Mole fractions. If None, uses current composition.
-        """
-        if X is not None:
-            self.gas.X = X
-        self.gas.DP = rho, p
-
-    def pressure(self, rho: np.ndarray, e: np.ndarray,
-                 X: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        Compute pressure from density and internal energy
-
-        This iterates through each cell and uses Cantera to get p.
-        For vectorized performance, consider using batch methods.
+        Compute pressure from density and internal energy.
 
         Parameters:
         -----------
@@ -356,8 +298,6 @@ class CanteraEOS:
             Density [kg/m³]
         e : array
             Specific internal energy [J/kg]
-        X : array, optional
-            Mole fractions [n_cells, n_species]. If None, uses stored composition.
 
         Returns:
         --------
@@ -366,34 +306,26 @@ class CanteraEOS:
         """
         rho = np.atleast_1d(rho)
         e = np.atleast_1d(e)
+
+        if not self._use_cantera:
+            # Ideal gas: p = (gamma - 1) * rho * e
+            return np.maximum((self._gamma - 1.0) * rho * e, 1e-15)
+
+        # Cantera path
         n = len(rho)
         p = np.zeros(n)
-
         for i in range(n):
             v = 1.0 / max(rho[i], 1e-15)
-            # Note: internal energy can be negative for Cantera reference states
-            u = e[i]
-
-            if X is not None and X.ndim == 2:
-                self.gas.X = X[i, :]
-
             try:
-                self.gas.UV = u, v
-                p[i] = max(self.gas.P, 1e-15)
+                self._gas.UV = e[i], v
+                p[i] = max(self._gas.P, 1e-15)
             except Exception:
-                # Fallback to ideal gas approximation if Cantera fails
-                # Use stored mixture gamma instead of hardcoded air value
-                gamma = self._initial_gamma
-                p[i] = max((gamma - 1.0) * rho[i] * e[i], 1e-15)
-
+                p[i] = max((self._gamma - 1.0) * rho[i] * e[i], 1e-15)
         return p
 
-    def sound_speed(self, rho: np.ndarray, p: np.ndarray,
-                    X: Optional[np.ndarray] = None) -> np.ndarray:
+    def sound_speed(self, rho: np.ndarray, p: np.ndarray) -> np.ndarray:
         """
-        Compute adiabatic sound speed using Cantera
-
-        c = sqrt(γ * p / ρ) where γ = Cp/Cv from Cantera
+        Compute adiabatic sound speed.
 
         Parameters:
         -----------
@@ -401,8 +333,6 @@ class CanteraEOS:
             Density [kg/m³]
         p : array
             Pressure [Pa]
-        X : array, optional
-            Mole fractions [n_cells, n_species]
 
         Returns:
         --------
@@ -411,27 +341,26 @@ class CanteraEOS:
         """
         rho = np.atleast_1d(rho)
         p = np.atleast_1d(p)
+
+        if not self._use_cantera:
+            # Ideal gas: c = sqrt(gamma * p / rho)
+            return np.sqrt(np.maximum(self._gamma * p / rho, 1e-15))
+
+        # Cantera path
         n = len(rho)
         c = np.zeros(n)
-
         for i in range(n):
-            if X is not None and X.ndim == 2:
-                self.gas.X = X[i, :]
-
             try:
-                self.gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
-                gamma = self.gas.cp / self.gas.cv
+                self._gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
+                gamma = self._gas.cp / self._gas.cv
                 c[i] = np.sqrt(max(gamma * p[i] / rho[i], 1e-15))
             except Exception:
-                # Fallback using stored mixture gamma
-                c[i] = np.sqrt(max(self._initial_gamma * p[i] / rho[i], 1e-15))
-
+                c[i] = np.sqrt(max(self._gamma * p[i] / rho[i], 1e-15))
         return c
 
-    def internal_energy(self, rho: np.ndarray, p: np.ndarray,
-                       X: Optional[np.ndarray] = None) -> np.ndarray:
+    def internal_energy(self, rho: np.ndarray, p: np.ndarray) -> np.ndarray:
         """
-        Compute internal energy from density and pressure using Cantera
+        Compute internal energy from density and pressure.
 
         Parameters:
         -----------
@@ -439,8 +368,6 @@ class CanteraEOS:
             Density [kg/m³]
         p : array
             Pressure [Pa]
-        X : array, optional
-            Mole fractions
 
         Returns:
         --------
@@ -449,26 +376,25 @@ class CanteraEOS:
         """
         rho = np.atleast_1d(rho)
         p = np.atleast_1d(p)
+
+        if not self._use_cantera:
+            # Ideal gas: e = p / ((gamma - 1) * rho)
+            return p / ((self._gamma - 1.0) * rho)
+
+        # Cantera path
         n = len(rho)
         e = np.zeros(n)
-
         for i in range(n):
-            if X is not None and X.ndim == 2:
-                self.gas.X = X[i, :]
-
             try:
-                self.gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
-                e[i] = self.gas.int_energy_mass  # Internal energy per unit mass
+                self._gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
+                e[i] = self._gas.int_energy_mass
             except Exception:
-                # Fallback to ideal gas using stored mixture gamma
-                e[i] = p[i] / ((self._initial_gamma - 1.0) * rho[i])
-
+                e[i] = p[i] / ((self._gamma - 1.0) * rho[i])
         return e
 
-    def temperature(self, rho: np.ndarray, p: np.ndarray,
-                   X: Optional[np.ndarray] = None) -> np.ndarray:
+    def temperature(self, rho: np.ndarray, p: np.ndarray) -> np.ndarray:
         """
-        Compute temperature from density and pressure using Cantera
+        Compute temperature from density and pressure.
 
         Parameters:
         -----------
@@ -476,8 +402,6 @@ class CanteraEOS:
             Density [kg/m³]
         p : array
             Pressure [Pa]
-        X : array, optional
-            Mole fractions
 
         Returns:
         --------
@@ -486,29 +410,25 @@ class CanteraEOS:
         """
         rho = np.atleast_1d(rho)
         p = np.atleast_1d(p)
+
+        if not self._use_cantera:
+            # Ideal gas: T = p / (rho * R)
+            return p / (rho * self._R_gas)
+
+        # Cantera path
         n = len(rho)
         T = np.zeros(n)
-
         for i in range(n):
-            if X is not None and X.ndim == 2:
-                self.gas.X = X[i, :]
-
             try:
-                self.gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
-                T[i] = self.gas.T
+                self._gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
+                T[i] = self._gas.T
             except Exception:
-                # Fallback using ideal gas law with actual mixture molecular weight
-                R_universal = 8.314  # J/(mol·K)
-                M = self.gas.mean_molecular_weight / 1000.0  # kg/mol
-                R_specific = R_universal / M  # J/(kg·K)
-                T[i] = p[i] / (rho[i] * R_specific)
-
+                T[i] = p[i] / (rho[i] * self._R_gas)
         return T
 
-    def total_energy(self, rho: np.ndarray, u: np.ndarray, p: np.ndarray,
-                    X: Optional[np.ndarray] = None) -> np.ndarray:
+    def total_energy(self, rho: np.ndarray, u: np.ndarray, p: np.ndarray) -> np.ndarray:
         """
-        Compute total specific energy E = e + 0.5*u²
+        Compute total specific energy E = e + 0.5*u².
 
         Parameters:
         -----------
@@ -518,21 +438,18 @@ class CanteraEOS:
             Velocity [m/s]
         p : array
             Pressure [Pa]
-        X : array, optional
-            Mole fractions
 
         Returns:
         --------
         E : array
             Total specific energy [J/kg]
         """
-        e = self.internal_energy(rho, p, X)
-        return e + 0.5 * u**2
+        e = self.internal_energy(rho, p)
+        return e + 0.5 * np.atleast_1d(u)**2
 
-    def get_viscosity(self, rho: np.ndarray, p: np.ndarray,
-                     X: Optional[np.ndarray] = None) -> np.ndarray:
+    def entropy(self, rho: np.ndarray, p: np.ndarray) -> np.ndarray:
         """
-        Get dynamic viscosity from Cantera transport properties
+        Compute specific entropy.
 
         Parameters:
         -----------
@@ -540,83 +457,6 @@ class CanteraEOS:
             Density [kg/m³]
         p : array
             Pressure [Pa]
-        X : array, optional
-            Mole fractions
-
-        Returns:
-        --------
-        mu : array
-            Dynamic viscosity [Pa·s]
-        """
-        rho = np.atleast_1d(rho)
-        p = np.atleast_1d(p)
-        n = len(rho)
-        mu = np.zeros(n)
-
-        for i in range(n):
-            if X is not None and X.ndim == 2:
-                self.gas.X = X[i, :]
-
-            try:
-                self.gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
-                mu[i] = self.gas.viscosity
-            except Exception:
-                # Sutherland's law fallback using stored mixture R_gas
-                T = p[i] / (rho[i] * self._initial_R_gas)
-                mu[i] = 1.458e-6 * T**1.5 / (T + 110.4)
-
-        return mu
-
-    def get_thermal_conductivity(self, rho: np.ndarray, p: np.ndarray,
-                                  X: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        Get thermal conductivity from Cantera transport properties
-
-        Parameters:
-        -----------
-        rho : array
-            Density [kg/m³]
-        p : array
-            Pressure [Pa]
-        X : array, optional
-            Mole fractions
-
-        Returns:
-        --------
-        k : array
-            Thermal conductivity [W/(m·K)]
-        """
-        rho = np.atleast_1d(rho)
-        p = np.atleast_1d(p)
-        n = len(rho)
-        k = np.zeros(n)
-
-        for i in range(n):
-            if X is not None and X.ndim == 2:
-                self.gas.X = X[i, :]
-
-            try:
-                self.gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
-                k[i] = self.gas.thermal_conductivity
-            except Exception:
-                # Approximate value for air
-                k[i] = 0.025
-
-        return k
-
-    def entropy(self, rho: np.ndarray, p: np.ndarray,
-                X: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        Compute specific entropy using Cantera.
-
-        Parameters:
-        -----------
-        rho : array
-            Density [kg/m³]
-        p : array
-            Pressure [Pa]
-        X : array, optional
-            Mole fractions
 
         Returns:
         --------
@@ -625,26 +465,82 @@ class CanteraEOS:
         """
         rho = np.atleast_1d(rho)
         p = np.atleast_1d(p)
+
+        p_ref = 101325.0
+        rho_ref = 1.0
+        c_v = self._R_gas / (self._gamma - 1.0)
+
+        if not self._use_cantera:
+            # Ideal gas entropy
+            return c_v * (np.log(p / p_ref) - self._gamma * np.log(rho / rho_ref))
+
+        # Cantera path
         n = len(rho)
         s = np.zeros(n)
+        for i in range(n):
+            try:
+                self._gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
+                s[i] = self._gas.entropy_mass
+            except Exception:
+                s[i] = c_v * (np.log(p[i] / p_ref) - self._gamma * np.log(rho[i] / rho_ref))
+        return s
+
+    # Cantera-specific methods (no-op for ideal gas mode)
+    def set_state_DP(self, rho: float, p: float):
+        """Set state from density and pressure (Cantera only)."""
+        if self._use_cantera and self._gas is not None:
+            self._gas.DP = rho, p
+
+    def set_state_UV(self, u: float, v: float):
+        """Set state from internal energy and specific volume (Cantera only)."""
+        if self._use_cantera and self._gas is not None:
+            self._gas.UV = u, v
+
+    def get_viscosity(self, rho: np.ndarray, p: np.ndarray) -> np.ndarray:
+        """
+        Get dynamic viscosity [Pa·s].
+
+        Uses Cantera transport if available, otherwise Sutherland's law.
+        """
+        rho = np.atleast_1d(rho)
+        p = np.atleast_1d(p)
+        n = len(rho)
+        mu = np.zeros(n)
 
         for i in range(n):
-            if X is not None and X.ndim == 2:
-                self.gas.X = X[i, :]
+            T = p[i] / (rho[i] * self._R_gas)  # Estimate T for fallback
+            if self._use_cantera and self._gas is not None:
+                try:
+                    self._gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
+                    mu[i] = self._gas.viscosity
+                    continue
+                except Exception:
+                    pass
+            # Sutherland's law fallback
+            mu[i] = 1.458e-6 * T**1.5 / (T + 110.4)
+        return mu
 
-            try:
-                self.gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
-                s[i] = self.gas.entropy_mass  # Specific entropy [J/(kg·K)]
-            except Exception:
-                # Fallback to ideal gas entropy formula
-                # s = c_v * ln(p/p_ref) - c_p * ln(rho/rho_ref) + s_ref
-                # Using stored gamma and R_gas
-                p_ref = 101325.0
-                rho_ref = 1.0
-                c_v = self._initial_R_gas / (self._initial_gamma - 1.0)
-                s[i] = c_v * (np.log(p[i] / p_ref) - self._initial_gamma * np.log(rho[i] / rho_ref))
+    def get_thermal_conductivity(self, rho: np.ndarray, p: np.ndarray) -> np.ndarray:
+        """
+        Get thermal conductivity [W/(m·K)].
 
-        return s
+        Uses Cantera transport if available, otherwise approximate value.
+        """
+        rho = np.atleast_1d(rho)
+        p = np.atleast_1d(p)
+        n = len(rho)
+        k = np.zeros(n)
+
+        for i in range(n):
+            if self._use_cantera and self._gas is not None:
+                try:
+                    self._gas.DP = max(rho[i], 1e-15), max(p[i], 1e-10)
+                    k[i] = self._gas.thermal_conductivity
+                    continue
+                except Exception:
+                    pass
+            k[i] = 0.025  # Approximate for air
+        return k
 
 
 class ExactRiemannSolver:
@@ -657,7 +553,7 @@ class ExactRiemannSolver:
     Reference: Toro (2009), Chapter 4
     """
 
-    def __init__(self, eos: IdealGasEOS, tol: float = 1e-8, max_iter: int = 50):
+    def __init__(self, eos: EOS, tol: float = 1e-8, max_iter: int = 50):
         self.eos = eos
         self.gamma = eos.gamma
         self.tol = tol
@@ -766,7 +662,7 @@ class LagrangianSolver:
     """
 
     def __init__(self,
-                 eos: Optional[Union['IdealGasEOS', 'CanteraEOS']] = None,
+                 eos: Optional['EOS'] = None,
                  gas_config: Optional[Dict[str, Any]] = None,
                  mechanism: Optional[str] = None,
                  gas_composition: Optional[str] = None,
@@ -804,9 +700,9 @@ class LagrangianSolver:
 
         Parameters:
         -----------
-        eos : CanteraEOS or IdealGasEOS, optional
-            Equation of state. If provided, this takes highest priority.
-            Required to be CanteraEOS when enable_flame_coupling=True.
+        eos : EOS, optional
+            Unified equation of state. If provided, this takes highest priority.
+            Requires Cantera backend (use_cantera=True) when enable_flame_coupling=True.
         gas_config : dict, optional
             Gas configuration dictionary with keys:
                 - 'T': Temperature [K]
@@ -815,7 +711,7 @@ class LagrangianSolver:
                 - 'Fuel': Fuel species (e.g., 'H2', 'CH4')
                 - 'Oxidizer': Oxidizer string (e.g., 'O2:1, N2:3.76')
                 - 'mech': Cantera mechanism file path
-            If provided and eos is None, creates CanteraEOS from this config.
+            If provided and eos is None, creates EOS with Cantera from this config.
         mechanism : str, optional
             Cantera mechanism file (e.g., 'gri30.yaml'). Alternative to gas_config.
         gas_composition : str, optional
@@ -825,12 +721,12 @@ class LagrangianSolver:
         initial_P : float
             Initial pressure [Pa] (default 101325.0). Used with mechanism/gas_composition.
         use_ideal_gas : bool
-            If True, explicitly use IdealGasEOS instead of Cantera (default False).
+            If True, explicitly use ideal gas mode instead of Cantera (default False).
             Also used as fallback if Cantera import fails.
         ideal_gas_gamma : float
-            Ratio of specific heats for IdealGasEOS (default 1.4).
+            Ratio of specific heats for ideal gas mode (default 1.4).
         ideal_gas_R : float
-            Specific gas constant [J/(kg·K)] for IdealGasEOS (default 287.0).
+            Specific gas constant [J/(kg·K)] for ideal gas mode (default 287.0).
         cfl : float
             CFL number for timestep calculation (default 0.5)
         bc_left, bc_right : str
@@ -899,109 +795,41 @@ class LagrangianSolver:
             Used when piston_velocity_model=CUSTOM
         """
         # =================================================================
-        # EOS Initialization Logic (two conditions):
-        # -----------------------------------------------------------------
-        # CONDITION 1 (Default - Cantera):
-        #   Priority: eos > gas_config > mechanism/composition > air fallback
-        #   Uses CanteraEOS for accurate thermodynamics
-        #
-        # CONDITION 2 (IdealGasEOS):
-        #   Only if: use_ideal_gas=True OR Cantera import fails
-        #   Uses isentropic ideal gas equations
+        # EOS Initialization: Use unified EOS class with auto-detection
+        # Priority: eos > gas_config > mechanism/composition > air > ideal gas
         # =================================================================
 
         if eos is not None:
             # Explicit EOS provided - use it directly
             self.eos = eos
         elif use_ideal_gas:
-            # Condition 2: Explicitly requested IdealGasEOS
+            # Explicitly requested ideal gas mode
             warnings.warn(
-                "Using IdealGasEOS as explicitly requested. For accurate "
+                "Using ideal gas mode as explicitly requested. For accurate "
                 "thermodynamic calculations (especially with flame coupling), "
-                "CanteraEOS is recommended.",
+                "Cantera is recommended.",
                 UserWarning,
                 stacklevel=2
             )
-            self.eos = IdealGasEOS(gamma=ideal_gas_gamma, R_gas=ideal_gas_R)
+            self.eos = EOS(gamma=ideal_gas_gamma, R_gas=ideal_gas_R)
+            # Force ideal gas mode by clearing Cantera
+            self.eos._use_cantera = False
+            self.eos._gas = None
+        elif gas_config is not None:
+            # Create EOS from gas_config (preferred method)
+            self.eos = EOS(gas_config=gas_config, gamma=ideal_gas_gamma, R_gas=ideal_gas_R)
+        elif mechanism is not None or gas_composition is not None:
+            # Build gas_config from mechanism/composition parameters
+            config = {
+                'mech': mechanism if mechanism is not None else 'air.yaml',
+                'T': initial_T,
+                'P': initial_P,
+                'composition': gas_composition if gas_composition is not None else 'O2:0.21, N2:0.79'
+            }
+            self.eos = EOS(gas_config=config, gamma=ideal_gas_gamma, R_gas=ideal_gas_R)
         else:
-            # Condition 1: Default to Cantera
-            try:
-                import cantera as ct
-
-                # Determine configuration source (priority: gas_config > mechanism/composition > air)
-                if gas_config is not None:
-                    # Use gas_config dictionary (similar to INPUT_PARAMS_CONFIG)
-                    mech = gas_config.get('mech', 'gri30.yaml')
-                    T = gas_config.get('T', 300.0)
-                    P = gas_config.get('P', 101325.0)
-                    fuel = gas_config.get('Fuel', None)
-                    oxidizer = gas_config.get('Oxidizer', 'O2:1, N2:3.76')
-                    phi = gas_config.get('Phi', 1.0)
-
-                    # Create gas object
-                    gas = ct.Solution(mech)
-
-                    if fuel is not None:
-                        # Set as fuel-oxidizer mixture at given equivalence ratio
-                        gas.set_equivalence_ratio(phi, fuel, oxidizer)
-                        gas.TP = T, P
-                    else:
-                        # Direct composition if no fuel specified
-                        composition = gas_config.get('composition', 'O2:0.21, N2:0.79')
-                        gas.TPX = T, P, composition
-
-                    self.eos = CanteraEOS(gas)
-
-                elif mechanism is not None or gas_composition is not None:
-                    # Use mechanism/composition parameters
-                    mech = mechanism if mechanism is not None else 'air.yaml'
-                    composition = gas_composition if gas_composition is not None else 'O2:0.21, N2:0.79'
-
-                    gas = ct.Solution(mech)
-                    gas.TPX = initial_T, initial_P, composition
-                    self.eos = CanteraEOS(gas)
-
-                else:
-                    # Fallback to air at STP (no configuration provided)
-                    warnings.warn(
-                        "No EOS or gas configuration provided. Falling back to air "
-                        "at STP (mechanism='air.yaml', composition='O2:0.21, N2:0.79', "
-                        "T=300K, P=101325Pa). For combustion simulations, provide "
-                        "gas_config or mechanism/gas_composition parameters.",
-                        UserWarning,
-                        stacklevel=2
-                    )
-                    gas = ct.Solution('air.yaml')
-                    gas.TPX = 300.0, 101325.0, 'O2:0.21, N2:0.79'
-                    self.eos = CanteraEOS(gas)
-
-            except ImportError:
-                # Condition 2 fallback: Cantera not available
-                warnings.warn(
-                    "Cantera not found - falling back to IdealGasEOS. "
-                    "Install Cantera for accurate thermodynamics: pip install cantera",
-                    UserWarning,
-                    stacklevel=2
-                )
-                self.eos = IdealGasEOS(gamma=ideal_gas_gamma, R_gas=ideal_gas_R)
-
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to create CanteraEOS: {e}\n"
-                    "Check your mechanism file and gas configuration, or use "
-                    "use_ideal_gas=True for simplified ideal gas EOS."
-                )
-
-        # Final warning if using IdealGasEOS (covers explicit eos=IdealGasEOS case)
-        if not isinstance(self.eos, CanteraEOS):
-            if eos is not None and isinstance(eos, IdealGasEOS):
-                # Only warn if user explicitly passed IdealGasEOS
-                warnings.warn(
-                    "Using IdealGasEOS. For accurate thermodynamic calculations, "
-                    "CanteraEOS is recommended.",
-                UserWarning,
-                stacklevel=2
-            )
+            # Default: auto-detect (Cantera with air, or ideal gas fallback)
+            self.eos = EOS(gamma=ideal_gas_gamma, R_gas=ideal_gas_R)
 
         self.riemann = ExactRiemannSolver(self.eos)
         self.cfl = cfl
@@ -1073,12 +901,12 @@ class LagrangianSolver:
                     "enable_flame_coupling requires a 'piston' or 'porous_piston' "
                     "boundary condition on at least one side"
                 )
-            # Flame coupling requires CanteraEOS for accurate temperature calculations
-            if not isinstance(self.eos, CanteraEOS):
+            # Flame coupling requires Cantera backend for accurate temperature calculations
+            if not self.eos.use_cantera:
                 raise ValueError(
-                    "Flame coupling requires CanteraEOS for accurate temperature "
-                    "calculations. IdealGasEOS is not supported with flame coupling. "
-                    "Please create a CanteraEOS instance with your mechanism and use it."
+                    "Flame coupling requires Cantera for accurate temperature "
+                    "calculations. Ideal gas mode is not supported with flame coupling. "
+                    "Install Cantera and provide a gas_config or mechanism."
                 )
 
         # Coupling diagnostics
@@ -1628,9 +1456,9 @@ class LagrangianSolver:
         e = state.e[idx]
         c = state.c[idx]
 
-        # Compute temperature using Cantera (CanteraEOS is enforced for flame coupling)
+        # Compute temperature using Cantera (enforced for flame coupling)
         # Use the gas object directly for accurate temperature from density and pressure
-        self.eos.gas.DP = rho, P
+        self.eos.set_state_DP(rho, P)
         T = self.eos.gas.T
 
         return {
@@ -2465,7 +2293,7 @@ def compute_exact_riemann(x: np.ndarray, t: float,
     rho, u, p : arrays
         Exact density, velocity, pressure at positions x and time t
     """
-    eos = IdealGasEOS(gamma=gamma)
+    eos = EOS(gamma=gamma)
     riemann = ExactRiemannSolver(eos)
 
     u_star, p_star = riemann.solve(rho_L, u_L, p_L, rho_R, u_R, p_R)
